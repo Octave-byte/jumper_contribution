@@ -1,4 +1,4 @@
-# Jumper Contribution Chart
+# Jumper Wallet Activity Contribution Front
 
 A simple Streamlit app showing your activity on Jumper
 
