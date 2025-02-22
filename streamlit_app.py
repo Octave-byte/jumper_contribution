@@ -1,151 +1,169 @@
 import streamlit as st
+import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
-import math
-from pathlib import Path
+import seaborn as sns
+import requests
+import time
+import datetime
+import calendar
 
-# Set the title and favicon that appear in the Browser's tab bar.
-st.set_page_config(
-    page_title='GDP dashboard',
-    page_icon=':earth_americas:', # This is an emoji shortcode. Could be a URL too.
-)
+# Constants
+API_BASE = "https://li.quest/v1/analytics/transfers"
+INTEGRATOR = "jumper.exchange"
 
-# -----------------------------------------------------------------------------
-# Declare some useful functions.
-
-@st.cache_data
-def get_gdp_data():
-    """Grab GDP data from a CSV file.
-
-    This uses caching to avoid having to read the file every time. If we were
-    reading from an HTTP endpoint instead of a file, it's a good idea to set
-    a maximum age to the cache with the TTL argument: @st.cache_data(ttl='1d')
+def fetch_transactions(wallet_address):
     """
+    Fetch transactions from the API for a given wallet address.
+    Returns a list of transactions and a dictionary of activity days.
+    """
+    # Get timestamp from one year ago
+    one_year_ago_timestamp = int(time.time()) - 365 * 24 * 60 * 60
+    api_url = f"{API_BASE}?integrator={INTEGRATOR}&wallet={wallet_address}&fromTimestamp={one_year_ago_timestamp}"
 
-    # Instead of a CSV on disk, you could read from an HTTP endpoint here too.
-    DATA_FILENAME = Path(__file__).parent/'data/gdp_data.csv'
-    raw_gdp_df = pd.read_csv(DATA_FILENAME)
+    # Fetch data
+    response = requests.get(api_url)
+    data = response.json()
+    transactions = data.get("transfers", [])
 
-    MIN_YEAR = 1960
-    MAX_YEAR = 2022
+    # Extract activity days
+    activity_days = {}
+    for tx in transactions:
+        timestamp = tx["receiving"]["timestamp"]
+        date = datetime.datetime.utcfromtimestamp(timestamp).date()
+        activity_days[date] = activity_days.get(date, 0) + 1
 
-    # The data above has columns like:
-    # - Country Name
-    # - Country Code
-    # - [Stuff I don't care about]
-    # - GDP for 1960
-    # - GDP for 1961
-    # - GDP for 1962
-    # - ...
-    # - GDP for 2022
-    #
-    # ...but I want this instead:
-    # - Country Name
-    # - Country Code
-    # - Year
-    # - GDP
-    #
-    # So let's pivot all those year-columns into two: Year and GDP
-    gdp_df = raw_gdp_df.melt(
-        ['Country Code'],
-        [str(x) for x in range(MIN_YEAR, MAX_YEAR + 1)],
-        'Year',
-        'GDP',
-    )
+    return transactions, activity_days
 
-    # Convert years from string to integers
-    gdp_df['Year'] = pd.to_numeric(gdp_df['Year'])
+def calculate_streaks(activity_days):
+    """
+    Calculate the current active streak and longest streak from activity days.
+    """
+    dates = sorted(activity_days.keys())
+    longest_streak = 0
+    current_streak = 0
+    max_streak = 0
+    previous_date = None
 
-    return gdp_df
-
-gdp_df = get_gdp_data()
-
-# -----------------------------------------------------------------------------
-# Draw the actual page
-
-# Set the title that appears at the top of the page.
-'''
-# :earth_americas: GDP dashboard
-
-Browse GDP data from the [World Bank Open Data](https://data.worldbank.org/) website. As you'll
-notice, the data only goes to 2022 right now, and datapoints for certain years are often missing.
-But it's otherwise a great (and did I mention _free_?) source of data.
-'''
-
-# Add some spacing
-''
-''
-
-min_value = gdp_df['Year'].min()
-max_value = gdp_df['Year'].max()
-
-from_year, to_year = st.slider(
-    'Which years are you interested in?',
-    min_value=min_value,
-    max_value=max_value,
-    value=[min_value, max_value])
-
-countries = gdp_df['Country Code'].unique()
-
-if not len(countries):
-    st.warning("Select at least one country")
-
-selected_countries = st.multiselect(
-    'Which countries would you like to view?',
-    countries,
-    ['DEU', 'FRA', 'GBR', 'BRA', 'MEX', 'JPN'])
-
-''
-''
-''
-
-# Filter the data
-filtered_gdp_df = gdp_df[
-    (gdp_df['Country Code'].isin(selected_countries))
-    & (gdp_df['Year'] <= to_year)
-    & (from_year <= gdp_df['Year'])
-]
-
-st.header('GDP over time', divider='gray')
-
-''
-
-st.line_chart(
-    filtered_gdp_df,
-    x='Year',
-    y='GDP',
-    color='Country Code',
-)
-
-''
-''
-
-
-first_year = gdp_df[gdp_df['Year'] == from_year]
-last_year = gdp_df[gdp_df['Year'] == to_year]
-
-st.header(f'GDP in {to_year}', divider='gray')
-
-''
-
-cols = st.columns(4)
-
-for i, country in enumerate(selected_countries):
-    col = cols[i % len(cols)]
-
-    with col:
-        first_gdp = first_year[first_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-        last_gdp = last_year[last_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-
-        if math.isnan(first_gdp):
-            growth = 'n/a'
-            delta_color = 'off'
+    for date in dates:
+        if previous_date and (date - previous_date).days == 1:
+            current_streak += 1
         else:
-            growth = f'{last_gdp / first_gdp:,.2f}x'
-            delta_color = 'normal'
+            current_streak = 1  # Reset streak if there's a gap
 
-        st.metric(
-            label=f'{country} GDP',
-            value=f'{last_gdp:,.0f}B',
-            delta=growth,
-            delta_color=delta_color
+        max_streak = max(max_streak, current_streak)
+        previous_date = date
+
+    # Check if the current streak is ongoing
+    today = datetime.date.today()
+    active_streak = current_streak if dates and today == dates[-1] else 0
+
+    return active_streak, max_streak
+
+def calculate_chain_and_amount(transactions):
+    """
+    Calculate the number of distinct receiving chainIds and total transaction amount in USD.
+    """
+    receiving_chain_ids = {tx["receiving"]["chainId"] for tx in transactions}
+    num_distinct_chain_ids = len(receiving_chain_ids)
+    total_amount_usd = sum(float(tx["receiving"]["amountUSD"]) for tx in transactions)
+
+    return num_distinct_chain_ids, total_amount_usd
+
+def generate_contribution_data(activity_days):
+    """
+    Generate data for a GitHub-style contribution graph.
+    Returns a 2D numpy array formatted for heatmap visualization.
+    """
+    if not activity_days:
+        return np.array([])
+
+    dates = sorted(activity_days.keys())
+    start_date = min(dates)
+    end_date = datetime.date.today()
+
+    # Create a daily activity array
+    num_days = (end_date - start_date).days + 1
+    heatmap_data = np.zeros(num_days)
+
+    for i in range(num_days):
+        date = start_date + datetime.timedelta(days=i)
+        heatmap_data[i] = activity_days.get(date, 0)
+
+    # Reshape into weeks (7-day rows)
+    start_weekday = start_date.weekday()  # Monday = 0, Sunday = 6
+    num_weeks = (num_days + start_weekday) // 7 + 1
+    padded_data = np.pad(heatmap_data, (start_weekday, num_weeks * 7 - (num_days + start_weekday)), 'constant')
+
+    heatmap_data = padded_data.reshape((num_weeks, 7)).T  # Transpose for correct orientation
+
+    return heatmap_data, start_date, end_date
+
+def analyze_wallet_activity(wallet_address):
+    transactions, activity_days = fetch_transactions(wallet_address)
+    active_streak, longest_streak = calculate_streaks(activity_days)
+    num_distinct_chain_ids, total_amount_usd = calculate_chain_and_amount(transactions)
+    heatmap_data, start_date, end_date = generate_contribution_data(activity_days)
+
+    return {
+        "num_distinct_chain_ids": num_distinct_chain_ids,
+        "total_amount_usd": total_amount_usd,
+        "active_streak": active_streak,
+        "longest_streak": longest_streak,
+        "heatmap_data": heatmap_data,
+        "start_date": start_date,
+        "end_date": end_date
+    }
+
+
+###############
+# Streamlit UI
+###############
+st.set_page_config(page_title="Jumper Wallet Activity", layout="wide")
+
+st.title("Your Last 365d Activity on Jumper")
+
+wallet_address = st.text_input("Enter your wallet address:", "")
+
+if wallet_address:
+    result = analyze_wallet_activity(wallet_address)
+    
+    st.subheader("Your Activity Summary")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Active Streak", result['active_streak'])
+    col2.metric("Longest Streak", result['longest_streak'])
+    col3.metric("Distinct Chains Visited", result['num_distinct_chain_ids'])
+    col4.metric("Total Volume (USD)", f"${result['total_amount_usd']:,.2f}")
+    
+    # Heatmap Contribution Graph
+    st.subheader("Your Jumper Contribution Graph")
+    heatmap_data = result['heatmap_data']
+    start_date = result['start_date']
+    end_date = result['end_date']
+
+    if heatmap_data is not None:
+        # Generate Month Labels
+        num_weeks = heatmap_data.shape[1]
+        date_labels = [start_date + datetime.timedelta(weeks=i) for i in range(num_weeks)]
+        month_labels = [calendar.month_abbr[d.month] if d.day <= 7 else '' for d in date_labels]
+
+        # Plot the contribution graph
+        fig, ax = plt.subplots(figsize=(12, 4))
+        sns.heatmap(
+            heatmap_data, cmap="Greens", linewidths=0.5, linecolor="gray",
+            cbar=False, square=True, ax=ax
         )
+
+        # Add x-axis labels (Months)
+        ax.set_xticks(np.arange(len(month_labels)) + 0.5)
+        ax.set_xticklabels(month_labels, rotation=45, ha="center", fontsize=10)
+
+        # Add y-axis labels (Days of Week)
+        ax.set_yticks(np.arange(7) + 0.5)
+        ax.set_yticklabels(['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'], rotation=0, fontsize=10)
+
+        ax.set_title("Contribution Graph")
+
+        st.pyplot(fig)
+        
+        st.markdown("\* Darker squares indicate more activity on that day.")
